@@ -1,0 +1,17 @@
+{
+  "name": "remotepad-server",
+  "version": "1.0.0",
+  "description": "RemotePad relay server: connects the web viewer to the Windows agent",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  }
+}
