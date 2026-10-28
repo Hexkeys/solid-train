@@ -18,7 +18,7 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 
 const ID_RE = /^[0-9]{9}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
-const VIEWER_ALLOWED = new Set(['mv', 'bt', 'wh', 'kd', 'ku', 'tx', 'ra', 'q']);
+const VIEWER_ALLOWED = new Set(['mv', 'rm', 'bt', 'wh', 'kd', 'ku', 'tx', 'ra', 'q']);
 const AGENT_ALLOWED = new Set(['size', 'cur']);
 
 const MAX_FAILS = 8; // wrong passwords per window, per device id and per ip
