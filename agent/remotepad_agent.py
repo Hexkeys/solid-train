@@ -154,6 +154,9 @@ class PynputInput:
     def move(self, x, y):
         self.ms.position = (int(x), int(y))
 
+    def move_rel(self, dx, dy):
+        self.ms.move(int(dx), int(dy))
+
     def cursor_pos(self):
         return self.ms.position
 
@@ -190,7 +193,7 @@ class PynputInput:
             return self._KeyCode.from_char(name)
         return None
 
-    def key(self, name, down):
+    def key(self, name, down, code=None):
         k = self._resolve(name)
         if k is None:
             return
@@ -219,17 +222,203 @@ class PynputInput:
         self._buttons.clear()
 
 
+# ------------------------------------------------ Windows input (games)
+# Games read the mouse and keyboard through Raw Input / DirectInput. They ignore
+# "teleport the cursor" calls and only see relative mouse motion and hardware
+# scan codes, so on Windows everything is injected with SendInput that way.
+SCANCODES = {
+    "Escape": (0x01, False), "Minus": (0x0C, False), "Equal": (0x0D, False),
+    "Backspace": (0x0E, False), "Tab": (0x0F, False),
+    "BracketLeft": (0x1A, False), "BracketRight": (0x1B, False),
+    "Enter": (0x1C, False), "ControlLeft": (0x1D, False),
+    "Semicolon": (0x27, False), "Quote": (0x28, False), "Backquote": (0x29, False),
+    "ShiftLeft": (0x2A, False), "Backslash": (0x2B, False),
+    "Comma": (0x33, False), "Period": (0x34, False), "Slash": (0x35, False),
+    "ShiftRight": (0x36, False), "NumpadMultiply": (0x37, False),
+    "AltLeft": (0x38, False), "Space": (0x39, False), "CapsLock": (0x3A, False),
+    "NumLock": (0x45, False), "ScrollLock": (0x46, False),
+    "NumpadSubtract": (0x4A, False), "NumpadAdd": (0x4E, False), "NumpadDecimal": (0x53, False),
+    "F11": (0x57, False), "F12": (0x58, False),
+    # extended keys (E0 prefix)
+    "NumpadEnter": (0x1C, True), "ControlRight": (0x1D, True), "NumpadDivide": (0x35, True),
+    "AltRight": (0x38, True), "Home": (0x47, True), "ArrowUp": (0x48, True),
+    "PageUp": (0x49, True), "ArrowLeft": (0x4B, True), "ArrowRight": (0x4D, True),
+    "End": (0x4F, True), "ArrowDown": (0x50, True), "PageDown": (0x51, True),
+    "Insert": (0x52, True), "Delete": (0x53, True),
+    "MetaLeft": (0x5B, True), "MetaRight": (0x5C, True), "ContextMenu": (0x5D, True),
+}
+for _i, _c in enumerate("1234567890"):
+    SCANCODES["Digit" + _c] = (0x02 + _i, False)
+for _row, _start in (("QWERTYUIOP", 0x10), ("ASDFGHJKL", 0x1E), ("ZXCVBNM", 0x2C)):
+    for _i, _c in enumerate(_row):
+        SCANCODES["Key" + _c] = (_start + _i, False)
+for _i in range(10):
+    SCANCODES["F%d" % (_i + 1)] = (0x3B + _i, False)
+for _name, _sc in (("7", 0x47), ("8", 0x48), ("9", 0x49), ("4", 0x4B), ("5", 0x4C),
+                   ("6", 0x4D), ("1", 0x4F), ("2", 0x50), ("3", 0x51), ("0", 0x52)):
+    SCANCODES["Numpad" + _name] = (_sc, False)
+
+NAME_TO_CODE = {
+    "Enter": "Enter", "Backspace": "Backspace", "Tab": "Tab", "Escape": "Escape",
+    " ": "Space", "Spacebar": "Space", "Delete": "Delete", "Insert": "Insert",
+    "Home": "Home", "End": "End", "PageUp": "PageUp", "PageDown": "PageDown",
+    "ArrowUp": "ArrowUp", "ArrowDown": "ArrowDown", "ArrowLeft": "ArrowLeft", "ArrowRight": "ArrowRight",
+    "Shift": "ShiftLeft", "Control": "ControlLeft", "Alt": "AltLeft", "Meta": "MetaLeft", "OS": "MetaLeft",
+    "CapsLock": "CapsLock", "NumLock": "NumLock", "ScrollLock": "ScrollLock", "ContextMenu": "ContextMenu",
+}
+PUNCT_TO_CODE = {
+    "`": "Backquote", "-": "Minus", "=": "Equal", "[": "BracketLeft", "]": "BracketRight",
+    "\\": "Backslash", ";": "Semicolon", "'": "Quote", ",": "Comma", ".": "Period", "/": "Slash",
+}
+
+
+def key_to_code(k):
+    """'a' -> 'KeyA', 'Enter' -> 'Enter', 'F5' -> 'F5'; None if the key has no scan code."""
+    if k in NAME_TO_CODE:
+        return NAME_TO_CODE[k]
+    if len(k) == 1:
+        c = k.lower()
+        if "a" <= c <= "z":
+            return "Key" + c.upper()
+        if "0" <= c <= "9":
+            return "Digit" + c
+        return PUNCT_TO_CODE.get(k)
+    if k.startswith("F") and k[1:].isdigit() and k in SCANCODES:
+        return k
+    return None
+
+
+class WinInput:
+    """Windows SendInput: relative mouse motion + hardware scan codes (works in games)."""
+
+    MOVE, LDOWN, LUP, RDOWN, RUP, MDOWN, MUP, WHEEL, HWHEEL = (
+        0x0001, 0x0002, 0x0004, 0x0008, 0x0010, 0x0020, 0x0040, 0x0800, 0x1000)
+    KEY_EXT, KEY_UP, KEY_UNICODE, KEY_SCAN = 0x0001, 0x0002, 0x0004, 0x0008
+
+    def __init__(self):
+        import ctypes.wintypes as wt
+        self.wt = wt
+        self.u32 = ctypes.windll.user32
+        ptr = ctypes.c_size_t
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", wt.LONG), ("dy", wt.LONG), ("mouseData", wt.DWORD),
+                        ("dwFlags", wt.DWORD), ("time", wt.DWORD), ("dwExtraInfo", ptr)]
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", wt.WORD), ("wScan", wt.WORD), ("dwFlags", wt.DWORD),
+                        ("time", wt.DWORD), ("dwExtraInfo", ptr)]
+
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [("uMsg", wt.DWORD), ("wParamL", wt.WORD), ("wParamH", wt.WORD)]
+
+        class _U(ctypes.Union):
+            _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wt.DWORD), ("u", _U)]
+
+        self.MOUSEINPUT, self.KEYBDINPUT, self.INPUT = MOUSEINPUT, KEYBDINPUT, INPUT
+        self.u32.SendInput.argtypes = (wt.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+        self.u32.SendInput.restype = wt.UINT
+        self.u32.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+        self._size = ctypes.sizeof(INPUT)
+        self._ctypes = ctypes
+        self._held = set()      # (scan, ext) of keys currently down
+        self._buttons = set()   # mouse buttons currently down
+
+    # low level
+    def _send(self, inp):
+        self.u32.SendInput(1, self._ctypes.byref(inp), self._size)
+
+    def _mouse(self, flags, dx=0, dy=0, data=0):
+        i = self.INPUT(type=0)
+        i.u.mi = self.MOUSEINPUT(int(dx), int(dy), data & 0xFFFFFFFF, flags, 0, 0)
+        self._send(i)
+
+    def _kbd(self, vk, scan, flags):
+        i = self.INPUT(type=1)
+        i.u.ki = self.KEYBDINPUT(vk, scan, flags, 0, 0)
+        self._send(i)
+
+    # mouse
+    def move(self, x, y):  # absolute (normal desktop use)
+        self.u32.SetCursorPos(int(x), int(y))
+
+    def move_rel(self, dx, dy):  # relative (what games read)
+        dx, dy = int(dx), int(dy)
+        if dx or dy:
+            self._mouse(self.MOVE, dx, dy)
+
+    def cursor_pos(self):
+        pt = self.wt.POINT()
+        self.u32.GetCursorPos(self._ctypes.byref(pt))
+        return pt.x, pt.y
+
+    def button(self, name, down):
+        flags = {"left": (self.LDOWN, self.LUP), "right": (self.RDOWN, self.RUP),
+                 "middle": (self.MDOWN, self.MUP)}.get(name)
+        if not flags:
+            return
+        self._mouse(flags[0] if down else flags[1])
+        (self._buttons.add if down else self._buttons.discard)(name)
+
+    def scroll(self, dx, dy):  # browser: +dy = down, Windows: +data = up
+        if dy:
+            self._mouse(self.WHEEL, data=int(-dy) * 120)
+        if dx:
+            self._mouse(self.HWHEEL, data=int(dx) * 120)
+
+    # keyboard
+    def key(self, name, down, code=None):
+        ent = SCANCODES.get(code) if code else None
+        if ent is None:
+            c = key_to_code(name)
+            ent = SCANCODES.get(c) if c else None
+        if ent is None:
+            if down and len(name) == 1:
+                self.type_text(name)
+            return
+        scan, ext = ent
+        flags = self.KEY_SCAN | (self.KEY_EXT if ext else 0) | (0 if down else self.KEY_UP)
+        self._kbd(0, scan, flags)
+        (self._held.add if down else self._held.discard)((scan, ext))
+
+    def type_text(self, s):  # any language: injected as Unicode characters
+        data = s.encode("utf-16-le")
+        for i in range(0, len(data), 2):
+            unit = data[i] | (data[i + 1] << 8)
+            self._kbd(0, unit, self.KEY_UNICODE)
+            self._kbd(0, unit, self.KEY_UNICODE | self.KEY_UP)
+
+    def release_all(self):
+        for scan, ext in list(self._held):
+            self._kbd(0, scan, self.KEY_SCAN | self.KEY_UP | (self.KEY_EXT if ext else 0))
+        self._held.clear()
+        for b in list(self._buttons):
+            self.button(b, False)
+
+
+def make_input():
+    if sys.platform == "win32":
+        try:
+            return WinInput()
+        except Exception:
+            pass
+    return PynputInput()
+
+
 # --------------------------------------------------------------- the agent
 class Agent:
     """Connection + capture + input logic (no GUI)."""
 
     def __init__(self, server_url, dev_id, password, screen_factory=MssScreen,
-                 input_factory=PynputInput, on_status=None, log=None):
+                 input_factory=None, on_status=None, log=None):
         self.ws_url = normalize_server(server_url)
         self.dev_id = dev_id
         self.password = password
         self.screen_factory = screen_factory
-        self.input_factory = input_factory
+        self.input_factory = input_factory or make_input
         self.on_status = on_status or (lambda status, detail="": None)
         self.log = log or (lambda *a: None)
 
@@ -376,6 +565,7 @@ class Agent:
 
     # ---- capture
     def _capture_loop(self, gen):
+        from PIL import Image
         screen = self.screen_factory()
         try:
             screen.open()
@@ -398,7 +588,7 @@ class Agent:
                     last_digest = None
                 if img.width > self.max_width:
                     h = max(1, int(img.height * self.max_width / img.width))
-                    img = img.resize((self.max_width, h))
+                    img = img.resize((self.max_width, h), Image.BILINEAR)
                 buf = io.BytesIO()
                 img.save(buf, "JPEG", quality=int(self.quality))
                 data = buf.getvalue()
@@ -452,14 +642,19 @@ class Agent:
                 if p:
                     inp.move(*p)
             inp.button(str(m.get("b", "left")), bool(m.get("d")))
+        elif t == "rm":  # relative mouse motion (game mode)
+            dx = max(-3000, min(3000, int(m.get("dx", 0))))
+            dy = max(-3000, min(3000, int(m.get("dy", 0))))
+            inp.move_rel(dx, dy)
         elif t == "wh":
             dx = max(-20, min(20, int(m.get("dx", 0))))
             dy = max(-20, min(20, int(m.get("dy", 0))))
             inp.scroll(dx, dy)
         elif t in ("kd", "ku"):
             k = str(m.get("k", ""))
+            code = str(m.get("c", ""))[:20] or None
             if 0 < len(k) <= 20:
-                inp.key(k, t == "kd")
+                inp.key(k, t == "kd", code)
         elif t == "tx":
             s = str(m.get("s", ""))[:200]
             if s:
@@ -469,7 +664,7 @@ class Agent:
         elif t == "q":
             self.quality = max(20, min(90, int(m.get("quality", self.quality))))
             self.max_width = max(480, min(3840, int(m.get("width", self.max_width))))
-            self.fps = max(1, min(20, int(m.get("fps", self.fps))))
+            self.fps = max(1, min(30, int(m.get("fps", self.fps))))
 
 
 # ------------------------------------------------------------------- GUI
