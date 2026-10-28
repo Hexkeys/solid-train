@@ -17,6 +17,23 @@
 
   const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
+  let gameMode = false;
+  let remoteW = 1920;
+  const locked = () => document.pointerLockElement === canvas;
+
+  // relative mouse motion (what games read), batched once per frame
+  let rmx = 0, rmy = 0, rmRaf = 0;
+  function sendRel(dx, dy) {
+    rmx += dx; rmy += dy;
+    if (rmRaf) return;
+    rmRaf = requestAnimationFrame(() => {
+      rmRaf = 0;
+      const x = Math.round(rmx), y = Math.round(rmy);
+      rmx -= x; rmy -= y;
+      if (x || y) send({ t: 'rm', dx: x, dy: y });
+    });
+  }
+
   // ------------------------------------------------------------- login
   try {
     const saved = localStorage.getItem('remotepad.id');
@@ -70,6 +87,7 @@
   function onText(m) {
     if (m.t === 'ok') {
       connected = true;
+      if (m.size && m.size.w) remoteW = m.size.w;
       pwInput.value = '';
       loginEl.hidden = true;
       deskEl.hidden = false;
@@ -81,7 +99,7 @@
     } else if (m.t === 'error') {
       lastError = m.msg || 'Error';
     } else if (m.t === 'size') {
-      if (m.w && m.h) setAspect(m.w / m.h);
+      if (m.w && m.h) { setAspect(m.w / m.h); remoteW = m.w; }
     } else if (m.t === 'cur') {
       if (!padActive) setCursor(m.x, m.y);
     }
@@ -147,6 +165,7 @@
     low: { quality: 40, width: 960, fps: 8 },
     med: { quality: 55, width: 1280, fps: 10 },
     high: { quality: 75, width: 1920, fps: 12 },
+    game: { quality: 45, width: 1280, fps: 30 },
   };
   function sendQuality() {
     const q = QUALITY[$('#quality').value] || QUALITY.med;
@@ -177,13 +196,26 @@
   canvas.addEventListener('pointerdown', (e) => {
     if (!connected) return;
     e.preventDefault();
+    if (gameMode) {
+      if (!locked()) { // first click captures the mouse; it is not sent as a shot
+        if (e.pointerType === 'mouse' && canvas.requestPointerLock) {
+          try {
+            const r = canvas.requestPointerLock({ unadjustedMovement: true });
+            if (r && r.catch) r.catch(() => { try { canvas.requestPointerLock(); } catch (_) {} });
+          } catch (_) { try { canvas.requestPointerLock(); } catch (__) {} }
+        }
+        return;
+      }
+      send({ t: 'bt', b: btnName(e.button), d: true }); // no coordinates: fire where you look
+      return;
+    }
     try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
     const p = norm(e);
     setCursor(p.x, p.y);
     send({ t: 'bt', b: btnName(e.button), d: true, x: p.x, y: p.y });
   });
   canvas.addEventListener('pointermove', (e) => {
-    if (!connected) return;
+    if (!connected || locked() || gameMode) return;
     if (e.pointerType !== 'mouse' && e.buttons === 0) return;
     const p = norm(e);
     setCursor(p.x, p.y);
@@ -191,9 +223,22 @@
   });
   const canvasUp = (e) => {
     if (!connected) return;
+    if (gameMode) {
+      if (locked()) send({ t: 'bt', b: btnName(e.button), d: false });
+      return;
+    }
     const p = norm(e);
     send({ t: 'bt', b: btnName(e.button), d: false, x: p.x, y: p.y });
   };
+  document.addEventListener('mousemove', (e) => {
+    if (connected && locked()) sendRel(e.movementX || 0, e.movementY || 0);
+  });
+  document.addEventListener('pointerlockchange', () => {
+    if (!connected) return;
+    statusEl.textContent = locked() ? 'Game mode: mouse captured (Esc releases)'
+      : gameMode ? 'Game mode: click the screen to capture the mouse' : 'Connected to ' + idInput.value;
+    if (!locked()) releaseEverything(true);
+  });
   canvas.addEventListener('pointerup', canvasUp);
   canvas.addEventListener('pointercancel', canvasUp);
   canvas.addEventListener('wheel', (e) => {
@@ -228,6 +273,11 @@
     pad.x = e.clientX; pad.y = e.clientY;
     pad.moved += Math.abs(dx) + Math.abs(dy);
     const r = canvas.getBoundingClientRect();
+    if (gameMode) { // look pad: drag = turn the camera
+      const k = (remoteW / r.width) * 1.3;
+      sendRel(dx * k, dy * k);
+      return;
+    }
     const sens = 1.7;
     setCursor(cur.x + (dx / r.width) * sens, cur.y + (dy / r.height) * sens);
     queueMove(cur.x, cur.y);
@@ -237,7 +287,7 @@
     const tap = pad.moved < 6 && performance.now() - pad.t < 300;
     pad = null;
     padActive = false;
-    if (tap && e.type === 'pointerup') {
+    if (tap && !gameMode && e.type === 'pointerup') {
       send({ t: 'bt', b: 'left', d: true });
       send({ t: 'bt', b: 'left', d: false });
     }
@@ -307,19 +357,24 @@
 
   // --------------------------------------------- physical keyboard
   const IGNORE = new Set(['Unidentified', 'Process', 'Dead', 'Compose']);
+  // Physical key position. Only sent when it matters (games, shortcuts, special keys)
+  // so normal typing in another language (e.g. Thai) still arrives as the right letters.
+  const keyCode = (e) =>
+    (gameMode || e.key.length !== 1 || e.ctrlKey || e.altKey || e.metaKey) ? e.code : undefined;
   document.addEventListener('keydown', (e) => {
     if (!connected || IGNORE.has(e.key)) return;
     if (e.target === kbInput && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) return; // beforeinput handles it
     if (e.target && /^(INPUT|SELECT)$/.test(e.target.tagName)) return;
     e.preventDefault();
-    send({ t: 'kd', k: e.key });
+    if (gameMode && e.repeat) return;
+    send({ t: 'kd', k: e.key, c: keyCode(e) });
   });
   document.addEventListener('keyup', (e) => {
     if (!connected || IGNORE.has(e.key)) return;
     if (e.target === kbInput && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) return;
     if (e.target && /^(INPUT|SELECT)$/.test(e.target.tagName)) return;
     e.preventDefault();
-    send({ t: 'ku', k: e.key });
+    send({ t: 'ku', k: e.key, c: keyCode(e) });
   });
   window.addEventListener('blur', () => releaseEverything(true));
   document.addEventListener('visibilitychange', () => { if (document.hidden) releaseEverything(true); });
@@ -437,6 +492,26 @@
 
   // ------------------------------------------------------------ toolbar
   $('#btnQuit').addEventListener('click', disconnect);
+  $('#btnGame').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    gameMode = !gameMode;
+    btn.classList.toggle('on', gameMode);
+    btn.textContent = gameMode ? 'Game mode ON' : 'Game mode';
+    if (gameMode) {
+      $('#quality').value = 'game';
+      sendQuality();
+      try { if (!document.fullscreenElement) await document.documentElement.requestFullscreen(); } catch (_) {}
+      try { if (navigator.keyboard && navigator.keyboard.lock) await navigator.keyboard.lock(); } catch (_) {}
+      statusEl.textContent = canvas.requestPointerLock
+        ? 'Game mode: click the screen to capture the mouse'
+        : 'Game mode: drag on the mouse picture to look around';
+    } else {
+      try { if (locked()) document.exitPointerLock(); } catch (_) {}
+      try { if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock(); } catch (_) {}
+      releaseEverything(true);
+      statusEl.textContent = 'Connected to ' + idInput.value;
+    }
+  });
   $('#btnFocus').addEventListener('click', (e) => {
     const on = deskEl.classList.toggle('screen-only');
     e.currentTarget.classList.toggle('on', on);
